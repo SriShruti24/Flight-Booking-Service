@@ -1,6 +1,7 @@
 const express=require('express');
 const {ServerConfig,Logger}=require('./config');
 const apiRoutes=require('./routes');
+const CRON = require('./utils/common/cron-jobs');
 
 const app=express();
 
@@ -11,5 +12,5 @@ const app=express();
 
 app.listen(ServerConfig.PORT,()=>{
     console.log(`Server is running on port: ${ServerConfig.PORT}`);
-    Logger.info("Successfully started the server",{})
+    CRON();
 });
