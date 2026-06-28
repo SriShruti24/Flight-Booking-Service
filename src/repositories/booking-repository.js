@@ -24,8 +24,9 @@ async createBooking(data,transaction){
         const response = await Booking.update(data, {
             where: {
                 id: id
-            }
-        }, {transaction: transaction});
+            },
+            transaction: transaction
+        });
         return response;
     }
     async cancelOldBookings(timestamp) {

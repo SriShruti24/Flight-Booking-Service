@@ -11,99 +11,211 @@ const {BOOKED,CANCELLED}=Enums.BOOKING_STATUS;
 const bookingRepository=new BookingRepository();
 
 async function createBooking(data) {
-  const transaction =await db.sequelize.transaction();
+  const transaction = await db.sequelize.transaction();
   try{
-     const flight = await axios.get(`${ServerConfig.FLIGHT_SERVICE}/api/v1/flights/${data.flightId}`);
-      const flightData = flight.data.data;
-      if (data.noOfSeats > flightData.totalSeats) {
-        throw new AppError("Not enough seats available", StatusCodes.BAD_REQUEST);
-      }
-      const totalBillingAmount=data.noOfSeats*flightData.price;
-      const bookingPayload={...data,totalCost:totalBillingAmount};//temporary booking status as initiated
-      const booking= await bookingRepository.create(bookingPayload,transaction);
+    const flight = await axios.get(`${ServerConfig.FLIGHT_SERVICE}/api/v1/flights/${data.flightId}`);
+    const flightData = flight.data.data;
+    
+    const seatNumbers = data.seatNumbers || [];
+    const noOfSeats = seatNumbers.length;
+    if (noOfSeats === 0) {
+      throw new AppError("At least one seat must be selected", StatusCodes.BAD_REQUEST);
+    }
 
-      await axios.patch(`${ServerConfig.FLIGHT_SERVICE}/api/v1/flights/${data.flightId}/seats`,{
-        seats:data.noOfSeats
-      });
+    // Call Flights Service to hold the selected seats
+    const holdResponse = await axios.post(`${ServerConfig.FLIGHT_SERVICE}/api/v1/flights/${data.flightId}/seats/hold`, {
+      seatNumbers: seatNumbers,
+      holdBy: data.userId.toString() // String representation of holder
+    });
 
+    const heldSeats = holdResponse.data.data;
+    const seatIds = heldSeats.map(seat => seat.id);
+    const resolvedSeatNumbers = heldSeats.map(seat => seat.seatNumber);
 
-      await transaction.commit();
-      return booking;
+    // Calculate total cost based on base price and individual seat fareMultiplier
+    let totalCost = 0;
+    for (const seat of heldSeats) {
+      totalCost += Math.round(flightData.price * parseFloat(seat.fareMultiplier));
+    }
+
+    const bookingPayload = {
+      flightId: data.flightId,
+      userId: data.userId,
+      status: 'INITIATED',
+      noOfSeats: noOfSeats,
+      totalCost: totalCost,
+      seatIds: seatIds,
+      seatNumbers: resolvedSeatNumbers
+    };
+
+    const booking = await bookingRepository.create(bookingPayload, { transaction });
+
+    await transaction.commit();
+    return booking;
   }catch(error){
     await transaction.rollback();
+    // If holding seats succeeded but booking creation failed, release the seats in Flights Service
+    if (error.response && error.response.status !== StatusCodes.CONFLICT) {
+      await axios.post(`${ServerConfig.FLIGHT_SERVICE}/api/v1/flights/${data.flightId}/seats/release`, {
+        seatNumbers: data.seatNumbers,
+        holdBy: data.userId.toString()
+      }).catch(() => {});
+    }
+    
+    if (error.response && error.response.data && error.response.data.error) {
+      throw new AppError(error.response.data.error.explanation || "Failed to hold seats", error.response.status);
+    }
     throw error;
   }
 }
 
 async function makePayment(data){
-  const transaction=await db.sequelize.transaction();
-  console.log(data);
+  const transaction = await db.sequelize.transaction();
   try {
-    const bookingDetails=await bookingRepository.get(data.bookingId,transaction);
-    if(bookingDetails.status==CANCELLED){
-      throw new AppError('The booking has expired',StatusCodes.BAD_REQUEST);
+    const bookingDetails = await bookingRepository.get(data.bookingId, transaction);
+    
+    if(bookingDetails.status == CANCELLED){
+      throw new AppError('The booking has expired', StatusCodes.BAD_REQUEST);
     }
-    const bookingTime=new Date(bookingDetails.createdAt);
-    const currentTime=new Date();
-    if(currentTime-bookingTime>300000){
+    
+    const bookingTime = new Date(bookingDetails.createdAt);
+    const currentTime = new Date();
+    if(currentTime - bookingTime > 300000){ // 5 minutes expiration
+      await transaction.commit(); // Release transaction lock first
       await cancelBooking(data.bookingId);
-      throw new AppError('The booking has expired',StatusCodes.BAD_REQUEST);
+      throw new AppError('The booking has expired', StatusCodes.BAD_REQUEST);
     }
-    if(bookingDetails.totalCost!=data.totalCost){
-      throw new AppError("The amount of the payment doesnt match", StatusCodes.BAD_REQUEST);
+    
+    if(bookingDetails.totalCost != data.totalCost){
+      throw new AppError("The amount of the payment doesn't match", StatusCodes.BAD_REQUEST);
     }
-    if(bookingDetails.userId !=data.userId){
-       throw new AppError("The user corresponding to the booking  doesnt match", StatusCodes.BAD_REQUEST);
+    
+    if(bookingDetails.userId != data.userId){
+       throw new AppError("The user corresponding to the booking doesn't match", StatusCodes.BAD_REQUEST);
     }
-    //we assume here payment is succesfull
-    await bookingRepository.update(data.bookingId,{status:BOOKED},transaction);
+
+    // Call Flights Service to confirm the seat holds
+    const parsedSeatNumbers = typeof bookingDetails.seatNumbers === 'string'
+      ? JSON.parse(bookingDetails.seatNumbers)
+      : bookingDetails.seatNumbers;
+
+    await axios.post(`${ServerConfig.FLIGHT_SERVICE}/api/v1/flights/${bookingDetails.flightId}/seats/confirm`, {
+      seatNumbers: parsedSeatNumbers,
+      holdBy: bookingDetails.userId.toString()
+    });
+
+    // Payment is successful
+    await bookingRepository.update(data.bookingId, { status: BOOKED }, transaction);
+
+    // Resolve the user email from the DB since services share the Flights database
+    const [user] = await db.sequelize.query("SELECT email FROM Users WHERE id = :userId", {
+      replacements: { userId: bookingDetails.userId },
+      type: db.sequelize.QueryTypes.SELECT
+    });
+    
+    const recipientEmail = user ? user.email : 'sri.shruti24@gmail.com';
+    const seatNumbersStr = parsedSeatNumbers.join(", ");
+
     Queue.sendData({
-        recepientEmail:'sri.shruti24@gmail.com',
-        subject:'Flight booked',
-        text:`Booking successfully done for the booking${data.bookingId}`
-      })
+      recepientEmail: recipientEmail,
+      subject: 'Flight Ticket Booked - Seat Confirmation',
+      text: `Booking successfully done for Booking ID: ${bookingDetails.id}.\nFlight ID: ${bookingDetails.flightId}\nTotal Cost: ₹${bookingDetails.totalCost.toLocaleString('en-IN')}\nYour confirmed seats are: ${seatNumbersStr}.\n\nThank you for flying with Booking Mafia!`
+    });
+
     await transaction.commit();
+    return { bookingId: data.bookingId, status: BOOKED };
   } catch (error) {
-     await transaction.rollback();
+    await transaction.rollback();
+    if (error.response && error.response.data && error.response.data.error) {
+      throw new AppError(error.response.data.error.explanation || "Failed to confirm seats", error.response.status);
+    }
     throw error;
   }
 }
-async function cancelBooking(bookingId) {
-    const transaction = await db.sequelize.transaction();
-    try {
-        const bookingDetails = await bookingRepository.get(bookingId, transaction);
-        console.log(bookingDetails);
-        if(bookingDetails.status == CANCELLED) {
-            await transaction.commit();
-            return true;
-        }
-        await axios.patch(`${ServerConfig.FLIGHT_SERVICE}/api/v1/flights/${bookingDetails.flightId}/seats`, {
-            seats: bookingDetails.noOfSeats,
-            dec: 0
-        });
-        await bookingRepository.update(bookingId, {status: CANCELLED}, transaction);
-        await transaction.commit();
 
-    } catch(error) {
-        await transaction.rollback();
-        throw error;
+async function cancelBooking(bookingId) {
+  const transaction = await db.sequelize.transaction();
+  try {
+    const bookingDetails = await bookingRepository.get(bookingId, transaction);
+    if(bookingDetails.status == CANCELLED) {
+      await transaction.commit();
+      return true;
     }
+
+    const parsedSeatNumbers = typeof bookingDetails.seatNumbers === 'string'
+      ? JSON.parse(bookingDetails.seatNumbers)
+      : bookingDetails.seatNumbers;
+
+    // Call Flights Service to release the seats
+    await axios.post(`${ServerConfig.FLIGHT_SERVICE}/api/v1/flights/${bookingDetails.flightId}/seats/release`, {
+      seatNumbers: parsedSeatNumbers,
+      holdBy: bookingDetails.userId.toString()
+    });
+
+    await bookingRepository.update(bookingId, { status: CANCELLED }, transaction);
+    await transaction.commit();
+  } catch(error) {
+    await transaction.rollback();
+    throw error;
+  }
 }
 
 async function cancelOldBookings() {
-    try {
-        console.log("Inside service")
-        const time = new Date( Date.now() - 1000 * 300 ); // time 5 mins ago
-        const response = await bookingRepository.cancelOldBookings(time);
-        
-        return response;
-    } catch(error) {
-        console.log(error);
+  try {
+    console.log("Inside service, cancelling old bookings...");
+    const time = new Date(Date.now() - 1000 * 300); // 5 mins ago
+    
+    // Find all bookings created before 'time' that are in INITIATED/PENDING status
+    const bookingsToCancel = await db.Booking.findAll({
+      where: {
+        createdAt: {
+          [db.Sequelize.Op.lt]: time
+        },
+        status: {
+          [db.Sequelize.Op.notIn]: [BOOKED, CANCELLED]
+        }
+      }
+    });
+
+    for (const booking of bookingsToCancel) {
+      console.log(`Cancelling booking ${booking.id}...`);
+      await cancelBooking(booking.id).catch(err => {
+        console.error(`Failed to cancel booking ${booking.id}:`, err.message);
+      });
     }
+    
+    return true;
+  } catch(error) {
+    console.log(error);
+  }
+}
+
+async function getBookingDetails(bookingId) {
+  try {
+    const booking = await bookingRepository.get(bookingId);
+    return booking;
+  } catch (error) {
+    throw error;
+  }
+}
+
+async function getUserBookings(userId) {
+  try {
+    const bookings = await db.Booking.findAll({
+      where: { userId },
+      order: [['createdAt', 'DESC']]
+    });
+    return bookings;
+  } catch (error) {
+    throw error;
+  }
 }
 
 module.exports = {
   createBooking,
   makePayment,
-  cancelOldBookings
+  cancelBooking,
+  cancelOldBookings,
+  getBookingDetails,
+  getUserBookings
 };
