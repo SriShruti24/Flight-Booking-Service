@@ -39,6 +39,14 @@ module.exports = (sequelize, DataTypes) => {
       type:DataTypes.INTEGER,
       allowNull:false
     },
+    seatIds: {
+      type:DataTypes.JSON,
+      allowNull:true
+    },
+    seatNumbers: {
+      type:DataTypes.JSON,
+      allowNull:true
+    },
   }, {
     sequelize,
     modelName: 'Booking',
