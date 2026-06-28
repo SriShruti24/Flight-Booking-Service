@@ -4,7 +4,9 @@ const info =(req,res)=>{
         success:true,
         message:'API IS LIVE',
         error:{},
-        data:{}
+        data:{
+            rabbitmqUrlSet: !!process.env.RABBITMQ_URL
+        }
     });
 }
 module.exports={
