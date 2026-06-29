@@ -1,4 +1,11 @@
 const axios = require("axios");
+
+// Shared HTTP client for all inter-service calls with an explicit timeout.
+// Without this, axios.get/post will hang indefinitely when the Flights Service
+// is cold-starting on Render, blocking the open DB transaction forever.
+const flightServiceClient = axios.create({
+  timeout: 30000, // 30-second timeout for Flights Service calls
+});
 const { StatusCodes } = require("http-status-codes");
 
 const { BookingRepository } = require("../repositories");
@@ -13,7 +20,7 @@ const bookingRepository=new BookingRepository();
 async function createBooking(data) {
   const transaction = await db.sequelize.transaction();
   try{
-    const flight = await axios.get(`${ServerConfig.FLIGHT_SERVICE}/api/v1/flights/${data.flightId}`);
+    const flight = await flightServiceClient.get(`${ServerConfig.FLIGHT_SERVICE}/api/v1/flights/${data.flightId}`);
     const flightData = flight.data.data;
     
     const seatNumbers = data.seatNumbers || [];
@@ -23,7 +30,7 @@ async function createBooking(data) {
     }
 
     // Call Flights Service to hold the selected seats
-    const holdResponse = await axios.post(`${ServerConfig.FLIGHT_SERVICE}/api/v1/flights/${data.flightId}/seats/hold`, {
+    const holdResponse = await flightServiceClient.post(`${ServerConfig.FLIGHT_SERVICE}/api/v1/flights/${data.flightId}/seats/hold`, {
       seatNumbers: seatNumbers,
       holdBy: data.userId.toString() // String representation of holder
     });
@@ -56,7 +63,7 @@ async function createBooking(data) {
     await transaction.rollback();
     // If holding seats succeeded but booking creation failed, release the seats in Flights Service
     if (error.response && error.response.status !== StatusCodes.CONFLICT) {
-      await axios.post(`${ServerConfig.FLIGHT_SERVICE}/api/v1/flights/${data.flightId}/seats/release`, {
+      await flightServiceClient.post(`${ServerConfig.FLIGHT_SERVICE}/api/v1/flights/${data.flightId}/seats/release`, {
         seatNumbers: data.seatNumbers,
         holdBy: data.userId.toString()
       }).catch(() => {});
@@ -99,7 +106,7 @@ async function makePayment(data){
       ? JSON.parse(bookingDetails.seatNumbers)
       : bookingDetails.seatNumbers;
 
-    await axios.post(`${ServerConfig.FLIGHT_SERVICE}/api/v1/flights/${bookingDetails.flightId}/seats/confirm`, {
+    await flightServiceClient.post(`${ServerConfig.FLIGHT_SERVICE}/api/v1/flights/${bookingDetails.flightId}/seats/confirm`, {
       seatNumbers: parsedSeatNumbers,
       holdBy: bookingDetails.userId.toString()
     });
@@ -147,7 +154,7 @@ async function cancelBooking(bookingId) {
       : bookingDetails.seatNumbers;
 
     // Call Flights Service to release the seats
-    await axios.post(`${ServerConfig.FLIGHT_SERVICE}/api/v1/flights/${bookingDetails.flightId}/seats/release`, {
+    await flightServiceClient.post(`${ServerConfig.FLIGHT_SERVICE}/api/v1/flights/${bookingDetails.flightId}/seats/release`, {
       seatNumbers: parsedSeatNumbers,
       holdBy: bookingDetails.userId.toString()
     });
